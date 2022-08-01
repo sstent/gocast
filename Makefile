@@ -14,3 +14,10 @@ test:
 
 linux:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o gocast -mod=vendor .
+
+linux_arm:
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm go build -o gocast -mod=vendor .
+
+linux_arm64:
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o gocast -mod=vendor .
+

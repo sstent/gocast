@@ -10,7 +10,13 @@ COPY . /go/src/github.com/mayuresh82/gocast
 
 WORKDIR /go/src/github.com/mayuresh82/gocast
 
-RUN make linux
+RUN if [ "$TARGETARCH" == "arm" ]; \
+      then make linux_arm
+ elif [ "$TARGETARCH" == "amd64" ]; \
+      then make linux
+ elif [ "$TARGETARCH" == "arm64" ]; \
+      then make linux_arm64
+fi
 
 FROM alpine:latest
 RUN apk --no-cache add ca-certificates bash iptables netcat-openbsd sudo
