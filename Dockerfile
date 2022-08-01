@@ -1,4 +1,5 @@
 FROM golang:1.14-alpine as builder
+ARG TARGETARCH 
 RUN apk update && \
     apk upgrade && \
     apk add --no-cache git && \
@@ -11,11 +12,11 @@ COPY . /go/src/github.com/mayuresh82/gocast
 WORKDIR /go/src/github.com/mayuresh82/gocast
 
 RUN if [ "$TARGETARCH" == "arm" ]; \
-      then make linux_arm
+      then make linux_arm; \
  elif [ "$TARGETARCH" == "amd64" ]; \
-      then make linux
+      then make linux; \
  elif [ "$TARGETARCH" == "arm64" ]; \
-      then make linux_arm64
+      then make linux_arm64; \
 fi
 
 FROM alpine:latest
