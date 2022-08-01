@@ -58,7 +58,7 @@ type appMon struct {
 	app       *App
 	done      chan bool
 	announced bool
-	checkOn   bool
+	runLoopOn bool
 }
 
 // MonitorMgr manages the lifecycle of registered apps
@@ -69,7 +69,8 @@ type MonitorMgr struct {
 	ctrl     *Controller
 	consul   *ConsulMon
 
-	sync.Mutex
+	monMu sync.Mutex
+	clMu  sync.Mutex
 }
 
 func NewMonitor(config *c.Config) *MonitorMgr {
@@ -123,7 +124,7 @@ func (m *MonitorMgr) consulMon() {
 			}
 			// remove currently running apps that are not discovered in this pass
 			var toRemove []string
-			m.Lock()
+			m.monMu.Lock()
 			for name, mon := range m.monitors {
 				if mon.app.Source != "consul" {
 					continue
@@ -140,10 +141,10 @@ func (m *MonitorMgr) consulMon() {
 					toRemove = append(toRemove, name)
 				}
 			}
+			m.monMu.Unlock()
 			for _, tr := range toRemove {
 				m.Remove(tr)
 			}
-			m.Unlock()
 		}
 		<-time.After(m.config.Agent.ConsulQueryInterval)
 	}
@@ -152,31 +153,44 @@ func (m *MonitorMgr) consulMon() {
 // Add adds a new app into monitor manager
 func (m *MonitorMgr) Add(app *App) {
 	// check if already running
-	m.Lock()
-	defer m.Unlock()
+	m.monMu.Lock()
+	var existing *appMon
 	for _, appMon := range m.monitors {
-		if appMon.app.Equal(app) && appMon.checkOn {
-			glog.V(2).Infof("App %s already exists", app.Name)
-			return
+		if appMon.app.Equal(app) {
+			glog.Infof("App %s already exists", app.Name)
+			existing = appMon
+			break
 		}
 		if appMon.app.Vip.Net.String() == app.Vip.Net.String() && appMon.app.Name != app.Name {
 			glog.Errorf("Error: Vip %s is already being announced by app: %s", app.Vip.Net.String(), appMon.app.Name)
+			m.monMu.Unlock()
 			return
 		}
 	}
-	m.Remove(app.Name)
-	appMon := &appMon{app: app, done: make(chan bool)}
-	m.monitors[app.Name] = appMon
-	go m.runLoop(appMon)
-	glog.Infof("Registered a new app: %v", app.String())
+	m.monMu.Unlock()
+	// if the same app already exists but its run loop is not running,
+	// then just restart the run loop
+	if existing != nil {
+		if !existing.runLoopOn {
+			go m.runLoop(existing)
+		}
+	} else {
+		// else add a new app and start its run loop
+		appMon := &appMon{app: app, done: make(chan bool)}
+		m.monitors[app.Name] = appMon
+		go m.runLoop(appMon)
+		glog.Infof("Registered a new app: %v", app.String())
+	}
 }
 
 // Remove removes an app from monitor manager, stops BGP
 /// announcement and cleans up state
 func (m *MonitorMgr) Remove(appName string) {
+	m.monMu.Lock()
+	defer m.monMu.Unlock()
 	if a, ok := m.monitors[appName]; ok {
-		if a.checkOn {
-			a.done <- true
+		if a.runLoopOn {
+			close(a.done)
 		}
 		if a.announced {
 			if err := m.ctrl.Withdraw(a.app.Vip); err != nil {
@@ -188,16 +202,23 @@ func (m *MonitorMgr) Remove(appName string) {
 		}
 		for _, nat := range a.app.Nats {
 			parts := strings.Split(nat, ":")
-			if len(parts) != 2 {
+			switch len(parts) {
+			case 3:
+				if err := natRule("D", a.app.Vip.Net.IP, m.ctrl.localIP, parts[0], parts[1], parts[2]); err != nil {
+					glog.Errorf("Failed to remove app: %s: %v", a.app.Name, err)
+				}
+			case 2:
+				if err := natRule("D", a.app.Vip.Net.IP, m.ctrl.localIP, parts[0], parts[1], parts[1]); err != nil {
+					glog.Errorf("Failed to remove app: %s: %v", a.app.Name, err)
+				}
+			default:
 				continue
-			}
-			if err := natRule("D", a.app.Vip.Net.IP, m.ctrl.localIP, parts[0], parts[1]); err != nil {
-				glog.Errorf("Failed to remove app: %s: %v", a.app.Name, err)
 			}
 		}
 	}
 	delete(m.monitors, appName)
 }
+
 func (m *MonitorMgr) runMonitors(app *App) bool {
 	for _, mon := range app.Monitors {
 		var check bool
@@ -223,8 +244,8 @@ func (m *MonitorMgr) runMonitors(app *App) bool {
 
 func (m *MonitorMgr) checkCond(am *appMon) error {
 	app := am.app
-	m.Lock()
-	defer m.Unlock()
+	m.clMu.Lock()
+	defer m.clMu.Unlock()
 	if m.runMonitors(app) {
 		glog.V(2).Infof("All Monitors for app: %s succeeded", app.Name)
 		if !am.announced {
@@ -233,11 +254,17 @@ func (m *MonitorMgr) checkCond(am *appMon) error {
 			}
 			for _, nat := range app.Nats {
 				parts := strings.Split(nat, ":")
-				if len(parts) != 2 {
+				switch len(parts) {
+				case 3:
+					if err := natRule("A", app.Vip.Net.IP, m.ctrl.localIP, parts[0], parts[1], parts[2]); err != nil {
+						return err
+					}
+				case 2:
+					if err := natRule("A", app.Vip.Net.IP, m.ctrl.localIP, parts[0], parts[1], parts[1]); err != nil {
+						return err
+					}
+				default:
 					continue
-				}
-				if err := natRule("A", app.Vip.Net.IP, m.ctrl.localIP, parts[0], parts[1]); err != nil {
-					return err
 				}
 			}
 			if err := m.ctrl.Announce(app.Vip); err != nil {
@@ -245,7 +272,8 @@ func (m *MonitorMgr) checkCond(am *appMon) error {
 			}
 			am.announced = true
 			if exit, ok := m.cleanups[app.Name]; ok {
-				exit <- true
+				close(exit)
+				delete(m.cleanups, app.Name)
 			}
 		}
 	} else {
@@ -265,7 +293,8 @@ func (m *MonitorMgr) checkCond(am *appMon) error {
 // runLoop periodically checks if an app passes healthchecks
 // and needs VIP announcement
 func (m *MonitorMgr) runLoop(am *appMon) {
-	am.checkOn = true
+	glog.Infof("Starting run-loop for app %s", am.app.Name)
+	am.runLoopOn = true
 	if err := m.checkCond(am); err != nil {
 		glog.Errorln(err)
 	}
@@ -278,7 +307,8 @@ func (m *MonitorMgr) runLoop(am *appMon) {
 				glog.Errorln(err)
 			}
 		case <-am.done:
-			glog.V(2).Infof("Exit run-loop for app: %s", am.app.Name)
+			glog.Infof("Exit run-loop for app: %s", am.app.Name)
+			am.runLoopOn = false
 			return
 		}
 	}
@@ -291,16 +321,20 @@ func (m *MonitorMgr) CloseAll() {
 		glog.Errorf("Failed to shut-down BGP: %v", err)
 	}
 	for _, am := range m.monitors {
-		if am.checkOn {
-			am.done <- true
+		if am.runLoopOn {
+			close(am.done)
 		}
 		deleteLoopback(am.app.Vip.Net)
 		for _, nat := range am.app.Nats {
 			parts := strings.Split(nat, ":")
-			if len(parts) != 2 {
+			switch len(parts) {
+			case 3:
+				natRule("D", am.app.Vip.Net.IP, m.ctrl.localIP, parts[0], parts[1], parts[2])
+			case 2:
+				natRule("D", am.app.Vip.Net.IP, m.ctrl.localIP, parts[0], parts[1], parts[1])
+			default:
 				continue
 			}
-			natRule("D", am.app.Vip.Net.IP, m.ctrl.localIP, parts[0], parts[1])
 		}
 	}
 }
@@ -313,9 +347,8 @@ func (m *MonitorMgr) Cleanup(app string, exit chan bool) {
 		select {
 		case <-t.C:
 			glog.Infof("Cleaning up app %s", app)
-			m.Lock()
 			m.Remove(app)
-			m.Unlock()
+			return
 		case <-exit:
 			return
 		}
